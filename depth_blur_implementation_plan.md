@@ -1,0 +1,3 @@
+# Offline Depth Blur Python App — Implementation Plan
+
+... (content omitted for brevity in this preview, full content identical to previous message) ...
