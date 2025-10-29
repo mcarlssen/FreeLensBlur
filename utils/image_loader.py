@@ -82,7 +82,7 @@ def load_jpeg_image(file_path: str) -> Tuple[np.ndarray, str]:
         return None, f"Error loading image: {str(e)}"
 
 
-def save_jpeg_image(image_array: np.ndarray, file_path: str, quality: int = 95) -> str:
+def save_jpeg_image(image_array: np.ndarray, file_path: str, quality: int = 97) -> str:
     """
     Save a numpy array as a JPEG image.
     

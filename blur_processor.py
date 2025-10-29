@@ -34,6 +34,7 @@ class BlurProcessor:
         self.max_workers = max_workers
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.device = self._detect_device()
+        self.force_cpu_mode = False  # Flag to force CPU processing
         print(f"BlurProcessor initialized on device: {self.device}")
     
     def _detect_device(self) -> str:
@@ -207,8 +208,8 @@ class BlurProcessor:
                               focal_point: Tuple[int, int], blur_strength: float, 
                               focal_length: float = 50.0) -> np.ndarray:
         """
-        Simplified focal blur implementation with focal length simulation.
-        Uses smooth pixel-level processing for creamy bokeh.
+        Simplified focal blur implementation with proper depth of field simulation.
+        Uses realistic depth of field physics for portrait-friendly adjustments.
         
         Args:
             image: Input RGB image (H, W, 3)
@@ -232,11 +233,16 @@ class BlurProcessor:
             depth_diff = np.abs(depth_map - focal_depth)
             print(f"Depth difference range: {depth_diff.min():.3f} to {depth_diff.max():.3f}")
             
-            # Apply focal length physics to depth-of-field calculation
-            focal_length_factor = focal_length / 50.0  # Normalize to 50mm baseline
-            adjusted_depth_diff = depth_diff * focal_length_factor
+            # Apply proper depth of field physics
+            # Depth of field is inversely proportional to focal length
+            # Longer lenses = shallower depth of field = more blur for same depth difference
+            dof_factor = self._calculate_depth_of_field_factor(focal_length)
+            print(f"Focal length: {focal_length}mm, DOF factor: {dof_factor:.3f}")
             
-            print(f"Focal length: {focal_length}mm, factor: {focal_length_factor:.2f}")
+            # Apply depth of field physics to create realistic blur falloff
+            # This creates the "breathing room" effect you want for portraits
+            adjusted_depth_diff = self._apply_depth_of_field_physics(depth_diff, focal_length, focal_depth)
+            
             print(f"Adjusted depth range: {adjusted_depth_diff.min():.3f} to {adjusted_depth_diff.max():.3f}")
             
             # Apply smooth, creamy bokeh blur
@@ -246,7 +252,8 @@ class BlurProcessor:
             # Create smooth depth-based blur using Gaussian falloff
             max_depth_diff = adjusted_depth_diff.max()
             
-            if max_depth_diff > 0.01:
+            if max_depth_diff > 0.001:  # Lowered threshold for more sensitive blur detection
+                print(f"✅ Applying blur - max depth difference: {max_depth_diff:.6f}")
                 # Create a range of blur levels for smooth interpolation
                 # Use more levels for creamier bokeh
                 base_blur_levels = [1, 3, 7, 15, 25, 41, 61, 85, 115]  # More levels, smoother transitions
@@ -279,7 +286,7 @@ class BlurProcessor:
                     for x in range(width):
                         depth_val = adjusted_depth_diff[y, x]
                         
-                        if depth_val <= 0.01:
+                        if depth_val <= 0.001:  # Lowered threshold for more sensitive blur detection
                             continue  # No blur for in-focus areas
                         
                         # Use Gaussian falloff instead of linear for creamier bokeh
@@ -310,11 +317,16 @@ class BlurProcessor:
                                 blurred_levels[upper_idx][y, x] * weight
                             )
             
-            # Apply edge-aware processing to reduce artifacts around subjects
-            blurred_image = self._apply_edge_aware_blur(blurred_image, image, adjusted_depth_diff, focal_depth)
-            
-            print(f"Applied smooth Gaussian-based bokeh with {len(blurred_levels)} levels")
-            return blurred_image
+                # Apply edge-aware processing to reduce artifacts around subjects
+                blurred_image = self._apply_edge_aware_blur(blurred_image, image, adjusted_depth_diff, focal_depth)
+                
+                print(f"Applied smooth Gaussian-based bokeh with {len(blurred_levels)} levels")
+                return blurred_image
+            else:
+                print(f"⚠️  SKIPPING BLUR - max depth difference too small: {max_depth_diff:.6f}")
+                print("   This usually means the image has insufficient depth variation.")
+                print("   Try using an image with clear foreground/background separation.")
+                return image
             
         except Exception as e:
             print(f"Error in apply_focal_blur_simple: {e}")
@@ -378,6 +390,95 @@ class BlurProcessor:
             print(f"Error in edge-aware processing: {e}")
             return blurred_image
     
+    def _calculate_depth_of_field_factor(self, focal_length: float) -> float:
+        """
+        Calculate depth of field factor based on focal length.
+        
+        Real depth of field physics:
+        - DOF ∝ 1/focal_length² (quadratic relationship)
+        - Longer lenses have much shallower depth of field
+        - This creates the "breathing room" effect for portraits
+        
+        Args:
+            focal_length: Focal length in mm
+            
+        Returns:
+            DOF factor (higher = more blur for same depth difference)
+        """
+        # Normalize to 50mm baseline (standard portrait lens)
+        baseline_focal_length = 50.0
+        
+        # Quadratic relationship: DOF ∝ 1/f²
+        # This means 100mm lens has 4x shallower DOF than 50mm lens
+        dof_factor = (focal_length / baseline_focal_length) ** 2
+        
+        # Clamp to reasonable range
+        dof_factor = max(0.1, min(dof_factor, 10.0))
+        
+        return dof_factor
+    
+    def _apply_depth_of_field_physics(self, depth_diff: np.ndarray, focal_length: float, focal_depth: float) -> np.ndarray:
+        """
+        Apply realistic depth of field physics to depth differences.
+        
+        This creates the "breathing room" effect you want:
+        - Wider lenses (24-35mm) = deeper DOF = more area stays sharp
+        - Longer lenses (85-200mm) = shallower DOF = less area stays sharp
+        
+        Args:
+            depth_diff: Raw depth differences from focal point
+            focal_length: Focal length in mm
+            focal_depth: Focal depth value
+            
+        Returns:
+            Adjusted depth differences with DOF physics applied
+        """
+        # Calculate DOF factor
+        dof_factor = self._calculate_depth_of_field_factor(focal_length)
+        
+        # Apply focus tolerance - this creates the "breathing room"
+        # Wider lenses have more tolerance for depth differences
+        if focal_length <= 35:  # Wide angle
+            focus_tolerance = 0.15  # More forgiving
+        elif focal_length <= 85:  # Standard to portrait
+            focus_tolerance = 0.08  # Moderate
+        else:  # Telephoto
+            focus_tolerance = 0.03  # Very strict
+        
+        print(f"🎯 Focus tolerance: {focus_tolerance:.3f} (focal_length={focal_length}mm)")
+        
+        # Apply DOF physics with focus tolerance
+        # This creates the realistic depth of field behavior
+        adjusted_diff = depth_diff.copy()
+        
+        # Create focus tolerance zone - areas within this zone stay sharp
+        focus_mask = depth_diff <= focus_tolerance
+        adjusted_diff[focus_mask] = 0.0  # Keep these areas sharp
+        
+        # Apply DOF scaling to areas outside focus tolerance
+        out_of_focus_mask = depth_diff > focus_tolerance
+        if np.any(out_of_focus_mask):
+            # Scale depth differences by DOF factor
+            # Longer lenses make the same depth difference create more blur
+            adjusted_diff[out_of_focus_mask] = depth_diff[out_of_focus_mask] * dof_factor
+        
+        # Apply smooth transition at focus tolerance boundary
+        # This prevents harsh transitions between sharp and blurry areas
+        transition_width = focus_tolerance * 0.3  # 30% of focus tolerance
+        transition_mask = (depth_diff > focus_tolerance - transition_width) & (depth_diff <= focus_tolerance + transition_width)
+        
+        if np.any(transition_mask):
+            # Create smooth transition using sigmoid function
+            transition_values = depth_diff[transition_mask]
+            normalized_transition = (transition_values - (focus_tolerance - transition_width)) / (2 * transition_width)
+            normalized_transition = np.clip(normalized_transition, 0, 1)
+            
+            # Sigmoid transition for smooth falloff
+            sigmoid_transition = 1 / (1 + np.exp(-10 * (normalized_transition - 0.5)))
+            adjusted_diff[transition_mask] = transition_values * sigmoid_transition * dof_factor
+        
+        return adjusted_diff
+    
     def apply_focal_blur_gpu(self, image: np.ndarray, depth_map: np.ndarray,
                            focal_point: Tuple[int, int], blur_strength: float, 
                            focal_length: float = 50.0) -> np.ndarray:
@@ -395,8 +496,11 @@ class BlurProcessor:
         Returns:
             Blurred image
         """
-        if not TORCH_AVAILABLE or self.device == "cpu":
-            print("GPU not available, falling back to CPU blur")
+        if not TORCH_AVAILABLE or self.device == "cpu" or self.force_cpu_mode:
+            if self.force_cpu_mode:
+                print("🖥️ CPU mode forced - using CPU blur")
+            else:
+                print("GPU not available, falling back to CPU blur")
             return self.apply_focal_blur_simple(image, depth_map, focal_point, blur_strength, focal_length)
         
         try:
@@ -415,11 +519,15 @@ class BlurProcessor:
             depth_diff = torch.abs(depth_tensor - focal_depth)
             print(f"Depth difference range: {depth_diff.min().item():.3f} to {depth_diff.max().item():.3f}")
             
-            # Apply focal length physics
-            focal_length_factor = focal_length / 50.0
-            adjusted_depth_diff = depth_diff * focal_length_factor
+            # Apply proper depth of field physics (same as CPU version)
+            dof_factor = self._calculate_depth_of_field_factor(focal_length)
+            print(f"Focal length: {focal_length}mm, DOF factor: {dof_factor:.3f}")
             
-            print(f"Focal length: {focal_length}mm, factor: {focal_length_factor:.2f}")
+            # Convert depth differences to numpy for DOF physics calculation
+            depth_diff_np = depth_diff.cpu().numpy()
+            adjusted_depth_diff_np = self._apply_depth_of_field_physics(depth_diff_np, focal_length, focal_depth.item())
+            adjusted_depth_diff = torch.from_numpy(adjusted_depth_diff_np).to(self.device)
+            
             print(f"Adjusted depth range: {adjusted_depth_diff.min().item():.3f} to {adjusted_depth_diff.max().item():.3f}")
             
             # GPU-accelerated blur processing
@@ -428,7 +536,8 @@ class BlurProcessor:
             
             max_depth_diff = adjusted_depth_diff.max()
             
-            if max_depth_diff > 0.01:
+            if max_depth_diff > 0.001:  # Lowered threshold for more sensitive blur detection
+                print(f"✅ Applying GPU blur - max depth difference: {max_depth_diff:.6f}")
                 # Create blur levels
                 base_blur_levels = [1, 3, 7, 15, 25, 41, 61, 85, 115]
                 blur_levels = []
@@ -448,11 +557,12 @@ class BlurProcessor:
                     if blur_size <= 150:
                         sigma = blur_size / 3.0
                         # Use PyTorch's Gaussian blur (much faster on GPU)
-                        blurred_level = F.gaussian_blur2d(
-                            image_tensor.permute(2, 0, 1).unsqueeze(0), 
-                            kernel_size=[blur_size, blur_size], 
-                            sigma=[sigma, sigma]
-                        ).squeeze(0).permute(1, 2, 0)
+                        # Convert to CHW format and add batch dimension
+                        image_chw = image_tensor.permute(2, 0, 1).unsqueeze(0)
+                        
+                        # Apply Gaussian blur using conv2d with Gaussian kernel
+                        blurred_level = self._gaussian_blur_pytorch(image_chw, blur_size, sigma)
+                        blurred_level = blurred_level.squeeze(0).permute(1, 2, 0)
                         blurred_levels.append(blurred_level)
                 
                 print(f"Created {len(blurred_levels)} GPU blur levels")
@@ -496,15 +606,87 @@ class BlurProcessor:
                             blurred_levels[i + 1][interp_mask] * weights
                         )
             
-            # Convert back to numpy
-            result = blurred_image.cpu().numpy().astype(np.uint8)
-            print(f"Applied GPU-accelerated Gaussian bokeh with {len(blurred_levels)} levels")
-            return result
+                # Convert back to numpy
+                result = blurred_image.cpu().numpy().astype(np.uint8)
+                print(f"Applied GPU-accelerated Gaussian bokeh with {len(blurred_levels)} levels")
+                return result
+            else:
+                print(f"⚠️  SKIPPING GPU BLUR - max depth difference too small: {max_depth_diff:.6f}")
+                print("   This usually means the image has insufficient depth variation.")
+                print("   Try using an image with clear foreground/background separation.")
+                return image
             
         except Exception as e:
             print(f"Error in apply_focal_blur_gpu: {e}")
             print("Falling back to CPU implementation...")
             return self.apply_focal_blur_simple(image, depth_map, focal_point, blur_strength, focal_length)
+    
+    def _gaussian_blur_pytorch(self, image_tensor: torch.Tensor, kernel_size: int, sigma: float) -> torch.Tensor:
+        """
+        Apply Gaussian blur using PyTorch conv2d operations.
+        
+        Args:
+            image_tensor: Input tensor in CHW format with batch dimension (B, C, H, W)
+            kernel_size: Size of the Gaussian kernel
+            sigma: Standard deviation of the Gaussian kernel
+            
+        Returns:
+            Blurred tensor in same format
+        """
+        if kernel_size <= 1:
+            return image_tensor
+        
+        # Create Gaussian kernel
+        kernel = self._create_gaussian_kernel(kernel_size, sigma, image_tensor.device)
+        
+        # Apply blur to each channel separately
+        blurred_channels = []
+        for c in range(image_tensor.shape[1]):
+            channel = image_tensor[:, c:c+1, :, :]  # Keep channel dimension
+            blurred_channel = F.conv2d(channel, kernel, padding=kernel_size//2)
+            blurred_channels.append(blurred_channel)
+        
+        # Concatenate channels back together
+        blurred = torch.cat(blurred_channels, dim=1)
+        return blurred
+    
+    def _create_gaussian_kernel(self, kernel_size: int, sigma: float, device: torch.device) -> torch.Tensor:
+        """
+        Create a Gaussian kernel for convolution.
+        
+        Args:
+            kernel_size: Size of the kernel (should be odd)
+            sigma: Standard deviation
+            device: Device to create tensor on
+            
+        Returns:
+            Gaussian kernel tensor (1, 1, kernel_size, kernel_size)
+        """
+        # Create coordinate grids
+        coords = torch.arange(kernel_size, dtype=torch.float32, device=device)
+        coords = coords - kernel_size // 2
+        
+        # Create 2D coordinate grids
+        x, y = torch.meshgrid(coords, coords, indexing='ij')
+        
+        # Calculate Gaussian values
+        gaussian = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
+        
+        # Normalize
+        gaussian = gaussian / gaussian.sum()
+        
+        # Reshape for conv2d: (out_channels, in_channels, height, width)
+        kernel = gaussian.unsqueeze(0).unsqueeze(0)
+        
+        return kernel
+    
+    def set_cpu_mode(self, cpu_mode: bool):
+        """Set CPU mode flag."""
+        self.force_cpu_mode = cpu_mode
+        if cpu_mode:
+            print("🖥️ BlurProcessor: CPU mode enabled")
+        else:
+            print("🚀 BlurProcessor: GPU mode enabled")
     
     def cleanup(self):
         """Clean up thread pool executor."""

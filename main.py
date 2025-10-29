@@ -18,6 +18,7 @@ import cv2
 from depth_estimator import DepthEstimator
 from blur_processor import BlurProcessor
 from utils.image_loader import load_jpeg_image, save_jpeg_image, resize_for_preview
+from preferences import PreferencesManager
 
 
 class ImageDisplayWidget(QLabel):
@@ -178,13 +179,20 @@ class ProcessingThread(QThread):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.depth_estimator = DepthEstimator()
+        # Initialize with default values - will be updated from preferences
+        self.depth_estimator = DepthEstimator(
+            detail_level="high",
+            hole_filling_enabled=True,
+            background_correction_enabled=True,
+            smoothing_strength="medium"
+        )
         self.blur_processor = BlurProcessor()
         self.current_image = None
         self.depth_map = None
         self.focal_point = None
         self.blurred_result = None
         self.focal_length = 50.0
+        self.force_cpu_mode = False  # Flag to force CPU processing
         
     def has_blur_result(self):
         """Check if blur processing has completed."""
@@ -198,8 +206,12 @@ class ProcessingThread(QThread):
         
     def estimate_depth(self, image_array: np.ndarray):
         """Estimate depth map for the image."""
+        print(f"🔄 ProcessingThread: Starting depth estimation for new image")
         self.current_image = image_array
+        self.depth_map = None  # Clear previous depth map
         self.focal_point = None
+        self.blurred_result = None  # Clear previous blur result
+        print(f"✅ ProcessingThread: Cleared previous depth_map and blur_result")
         self.start()
     
     def apply_blur(self, focal_point: Tuple[int, int], blur_strength: float, focal_length: float = 50.0):
@@ -221,16 +233,29 @@ class ProcessingThread(QThread):
             
             # Estimate depth if not already done
             if self.depth_map is None:
+                print(f"🔄 ProcessingThread: Generating new depth map")
                 self.depth_map = self.depth_estimator.estimate_depth(self.current_image)
                 # Signal that depth estimation is complete
                 self.depth_completed.emit(self.depth_map)
+            else:
+                print(f"⚠️ ProcessingThread: Skipping depth estimation - depth_map already exists")
+                print(f"   This should not happen for new images!")
             
             # Apply blur if focal point is set
             if self.focal_point is not None:
-                blurred = self.blur_processor.apply_focal_blur_gpu(
-                    self.current_image, self.depth_map, 
-                    self.focal_point, self.blur_strength, self.focal_length
-                )
+                # Force CPU mode for blur processing if requested
+                if self.force_cpu_mode:
+                    print("🖥️ Forcing CPU mode for blur processing")
+                    blurred = self.blur_processor.apply_focal_blur_simple(
+                        self.current_image, self.depth_map, 
+                        self.focal_point, self.blur_strength, self.focal_length
+                    )
+                else:
+                    blurred = self.blur_processor.apply_focal_blur_gpu(
+                        self.current_image, self.depth_map, 
+                        self.focal_point, self.blur_strength, self.focal_length
+                    )
+                
                 self.blurred_result = blurred
                 # Signal that blur processing is complete
                 self.blur_completed.emit(blurred)
@@ -257,8 +282,43 @@ class DepthBlurApp(QMainWindow):
         self.showing_depth_map = False  # Track if we're showing depth map
         self.focal_length = 50.0  # Default focal length in mm
         
+        # Initialize preferences manager
+        self.preferences = PreferencesManager()
+        
         self.init_ui()
         self.setup_processing_thread()
+        self.load_preferences()
+    
+    def update_depth_settings(self, hole_filling_enabled: bool = None, 
+                            background_correction_enabled: bool = None,
+                            smoothing_strength: str = None):
+        """
+        Update depth estimator settings.
+        
+        Args:
+            hole_filling_enabled: Whether to enable hole filling
+            background_correction_enabled: Whether to enable background correction
+            smoothing_strength: Smoothing strength ("low", "medium", "high")
+        """
+        if hole_filling_enabled is not None:
+            self.processing_thread.depth_estimator.hole_filling_enabled = hole_filling_enabled
+        if background_correction_enabled is not None:
+            self.processing_thread.depth_estimator.background_correction_enabled = background_correction_enabled
+        if smoothing_strength is not None:
+            self.processing_thread.depth_estimator.smoothing_strength = smoothing_strength
+        
+        # Clear depth cache since settings changed
+        self.processing_thread.depth_estimator.clear_cache()
+        
+        # If we have a current image, regenerate the depth map
+        if self.current_image is not None:
+            print(f"🔄 Regenerating depth map with updated settings...")
+            self.status_bar.showMessage("Regenerating depth map with updated settings...")
+            self.depth_map = None  # Clear cached depth map
+            self.blurred_image = None  # Clear blurred result
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)  # Indeterminate progress
+            self.processing_thread.estimate_depth(self.current_image)
     
     def init_ui(self):
         """Initialize the user interface."""
@@ -324,6 +384,76 @@ class DepthBlurApp(QMainWindow):
         self.depth_map_action.setShortcut('Ctrl+M')
         self.depth_map_action.triggered.connect(self.toggle_depth_map)
         view_menu.addAction(self.depth_map_action)
+        
+        view_menu.addSeparator()
+        
+        # Depth detail submenu
+        detail_menu = view_menu.addMenu('Depth Detail Level')
+        
+        self.detail_high_action = QAction('High Detail', self)
+        self.detail_high_action.setCheckable(True)
+        self.detail_high_action.setChecked(True)  # Default to high detail
+        self.detail_high_action.triggered.connect(lambda: self.set_detail_level("high"))
+        detail_menu.addAction(self.detail_high_action)
+        
+        self.detail_medium_action = QAction('Medium Detail', self)
+        self.detail_medium_action.setCheckable(True)
+        self.detail_medium_action.triggered.connect(lambda: self.set_detail_level("medium"))
+        detail_menu.addAction(self.detail_medium_action)
+        
+        self.detail_low_action = QAction('Low Detail', self)
+        self.detail_low_action.setCheckable(True)
+        self.detail_low_action.triggered.connect(lambda: self.set_detail_level("low"))
+        detail_menu.addAction(self.detail_low_action)
+        
+        view_menu.addSeparator()
+        
+        # CPU mode toggle
+        self.cpu_mode_action = QAction('Force CPU Mode', self)
+        self.cpu_mode_action.setCheckable(True)
+        self.cpu_mode_action.setShortcut('Ctrl+C')
+        self.cpu_mode_action.triggered.connect(self.toggle_cpu_mode)
+        view_menu.addAction(self.cpu_mode_action)
+        
+        view_menu.addSeparator()
+        
+        # Depth processing submenu
+        depth_menu = view_menu.addMenu('Depth Processing')
+        
+        # Hole filling toggle
+        self.hole_filling_action = QAction('Enable Hole Filling', self)
+        self.hole_filling_action.setCheckable(True)
+        self.hole_filling_action.setChecked(True)  # Default enabled
+        self.hole_filling_action.triggered.connect(self.toggle_hole_filling)
+        depth_menu.addAction(self.hole_filling_action)
+        
+        # Background correction toggle
+        self.background_correction_action = QAction('Enable Background Correction', self)
+        self.background_correction_action.setCheckable(True)
+        self.background_correction_action.setChecked(True)  # Default enabled
+        self.background_correction_action.triggered.connect(self.toggle_background_correction)
+        depth_menu.addAction(self.background_correction_action)
+        
+        depth_menu.addSeparator()
+        
+        # Smoothing strength submenu
+        smoothing_menu = depth_menu.addMenu('Smoothing Strength')
+        
+        self.smoothing_low_action = QAction('Low Smoothing', self)
+        self.smoothing_low_action.setCheckable(True)
+        self.smoothing_low_action.triggered.connect(lambda: self.set_smoothing_strength("low"))
+        smoothing_menu.addAction(self.smoothing_low_action)
+        
+        self.smoothing_medium_action = QAction('Medium Smoothing', self)
+        self.smoothing_medium_action.setCheckable(True)
+        self.smoothing_medium_action.setChecked(True)  # Default
+        self.smoothing_medium_action.triggered.connect(lambda: self.set_smoothing_strength("medium"))
+        smoothing_menu.addAction(self.smoothing_medium_action)
+        
+        self.smoothing_high_action = QAction('High Smoothing', self)
+        self.smoothing_high_action.setCheckable(True)
+        self.smoothing_high_action.triggered.connect(lambda: self.set_smoothing_strength("high"))
+        smoothing_menu.addAction(self.smoothing_high_action)
     
     def create_image_display(self, parent_layout):
         """Create the image display area."""
@@ -363,7 +493,8 @@ class DepthBlurApp(QMainWindow):
         self.blur_slider.setMaximum(10)
         self.blur_slider.setValue(1)
         self.blur_slider.setMaximumHeight(25)  # Fixed height
-        self.blur_slider.valueChanged.connect(self.on_blur_strength_changed)
+        self.blur_slider.valueChanged.connect(self.on_blur_strength_value_changed)
+        self.blur_slider.sliderReleased.connect(self.on_blur_strength_released)
         controls_layout.addWidget(self.blur_slider)
         
         # Blur value label - compact
@@ -387,7 +518,8 @@ class DepthBlurApp(QMainWindow):
         self.focal_slider.setMaximum(200)  # Telephoto
         self.focal_slider.setValue(50)  # Normal lens
         self.focal_slider.setMaximumHeight(25)  # Fixed height
-        self.focal_slider.valueChanged.connect(self.on_focal_length_changed)
+        self.focal_slider.valueChanged.connect(self.on_focal_length_value_changed)
+        self.focal_slider.sliderReleased.connect(self.on_focal_length_released)
         controls_layout.addWidget(self.focal_slider)
         
         self.focal_value_label = QLabel("50mm")
@@ -412,6 +544,11 @@ class DepthBlurApp(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
+        
+        # Add processing mode indicator
+        self.mode_label = QLabel("GPU")
+        self.mode_label.setStyleSheet("color: #0078d4; font-weight: bold; padding: 2px 8px;")
+        self.status_bar.addPermanentWidget(self.mode_label)
     
     def setup_processing_thread(self):
         """Setup the processing thread."""
@@ -419,6 +556,95 @@ class DepthBlurApp(QMainWindow):
         # Connect signals
         self.processing_thread.depth_completed.connect(self.on_depth_completed)
         self.processing_thread.blur_completed.connect(self.on_blur_completed)
+    
+    def load_preferences(self):
+        """Load preferences and apply them to the UI."""
+        print("📁 Loading application preferences...")
+        
+        # Load dark mode preference
+        dark_mode = self.preferences.get_preference('ui', 'dark_mode', False)
+        if dark_mode != self.dark_mode:
+            self.dark_mode = dark_mode
+            self.dark_mode_action.setChecked(dark_mode)
+            self.apply_theme()
+            print(f"🌙 Dark mode: {'enabled' if dark_mode else 'disabled'}")
+        
+        # Load CPU mode preference
+        cpu_mode = self.preferences.get_preference('processing', 'cpu_mode', False)
+        if cpu_mode:
+            self.cpu_mode_action.setChecked(True)
+            self.toggle_cpu_mode()
+            print(f"🖥️ CPU mode: {'enabled' if cpu_mode else 'disabled'}")
+        
+        # Load detail level preference
+        detail_level = self.preferences.get_preference('processing', 'detail_level', 'high')
+        self.set_detail_level(detail_level)
+        print(f"🎨 Detail level: {detail_level}")
+        
+        # Load depth processing preferences
+        hole_filling_enabled = self.preferences.get_preference('depth', 'hole_filling_enabled', True)
+        background_correction_enabled = self.preferences.get_preference('depth', 'background_correction_enabled', True)
+        smoothing_strength = self.preferences.get_preference('depth', 'smoothing_strength', 'medium')
+        
+        self.hole_filling_action.setChecked(hole_filling_enabled)
+        self.background_correction_action.setChecked(background_correction_enabled)
+        
+        # Update smoothing strength checkboxes
+        self.smoothing_low_action.setChecked(smoothing_strength == "low")
+        self.smoothing_medium_action.setChecked(smoothing_strength == "medium")
+        self.smoothing_high_action.setChecked(smoothing_strength == "high")
+        
+        # Update depth estimator settings
+        self.update_depth_settings(hole_filling_enabled, background_correction_enabled, smoothing_strength)
+        print(f"🔧 Depth processing: hole_filling={hole_filling_enabled}, background_correction={background_correction_enabled}, smoothing={smoothing_strength}")
+        
+        # Load blur settings
+        blur_strength = self.preferences.get_preference('blur', 'blur_strength', 1)
+        focal_length = self.preferences.get_preference('blur', 'focal_length', 50)
+        
+        self.blur_slider.setValue(blur_strength)
+        self.blur_value_label.setText(f"{blur_strength}.0")
+        
+        self.focal_slider.setValue(focal_length)
+        self.focal_length = float(focal_length)
+        self.focal_value_label.setText(f"{focal_length}mm")
+        
+        print(f"🎚️ Blur settings: strength={blur_strength}, focal_length={focal_length}mm")
+        print("✅ Preferences loaded successfully")
+    
+    def save_preferences(self):
+        """Save current preferences to file."""
+        try:
+            # Get current preferences
+            preferences = {
+                'ui': {
+                    'dark_mode': self.dark_mode,
+                    'show_depth_map': self.showing_depth_map
+                },
+                'processing': {
+                    'cpu_mode': self.processing_thread.force_cpu_mode if self.processing_thread else False,
+                    'detail_level': self.processing_thread.depth_estimator.detail_level if self.processing_thread else 'high'
+                },
+                'depth': {
+                    'hole_filling_enabled': self.processing_thread.depth_estimator.hole_filling_enabled if self.processing_thread else True,
+                    'background_correction_enabled': self.processing_thread.depth_estimator.background_correction_enabled if self.processing_thread else True,
+                    'smoothing_strength': self.processing_thread.depth_estimator.smoothing_strength if self.processing_thread else 'medium'
+                },
+                'blur': {
+                    'blur_strength': self.blur_slider.value(),
+                    'focal_length': self.focal_slider.value()
+                }
+            }
+            
+            # Save to file
+            success = self.preferences.save_preferences(preferences)
+            if success:
+                print("💾 Preferences saved successfully")
+            else:
+                print("❌ Failed to save preferences")
+                
+        except Exception as e:
+            print(f"❌ Error saving preferences: {e}")
     
     def open_image(self):
         """Open an image file."""
@@ -485,16 +711,36 @@ class DepthBlurApp(QMainWindow):
         self.status_bar.showMessage(f"Focal point set at ({x}, {y}) - applying blur effect...")
         self._apply_blur_debounced()
     
-    def on_blur_strength_changed(self, value: int):
-        """Handle blur strength slider change."""
+    def on_blur_strength_value_changed(self, value: int):
+        """Handle blur strength slider value change (for display only)."""
         self.blur_value_label.setText(f"{value}.0")
-        self.blur_timer.start(300)  # Debounce blur application
     
-    def on_focal_length_changed(self, value: int):
-        """Handle focal length slider change."""
+    def on_blur_strength_released(self):
+        """Handle blur strength slider release (trigger calculation)."""
+        blur_value = self.blur_slider.value()
+        print(f"🎚️ Blur strength slider released at value: {blur_value}")
+        
+        # Save preference
+        self.preferences.set_preference('blur', 'blur_strength', blur_value)
+        self.save_preferences()
+        
+        self.blur_timer.start(100)  # Short delay to ensure UI is updated
+    
+    def on_focal_length_value_changed(self, value: int):
+        """Handle focal length slider value change (for display only)."""
         self.focal_length = float(value)
         self.focal_value_label.setText(f"{value}mm")
-        self.blur_timer.start(300)  # Debounce blur application
+    
+    def on_focal_length_released(self):
+        """Handle focal length slider release (trigger calculation)."""
+        focal_value = self.focal_slider.value()
+        print(f"🎚️ Focal length slider released at value: {focal_value}")
+        
+        # Save preference
+        self.preferences.set_preference('blur', 'focal_length', focal_value)
+        self.save_preferences()
+        
+        self.blur_timer.start(100)  # Short delay to ensure UI is updated
     
     def _apply_blur_debounced(self):
         """Apply blur effect with debouncing."""
@@ -529,13 +775,21 @@ class DepthBlurApp(QMainWindow):
     def on_blur_completed(self, blurred_image: np.ndarray):
         """Handle blur application completion."""
         try:
+            print(f"🔍 DEBUG: on_blur_completed called with image shape: {blurred_image.shape}")
+            print(f"🔍 DEBUG: blurred_image mean: {blurred_image.mean():.3f}")
+            
             self.blurred_image = blurred_image
             
             # Only update preview if we're not showing depth map
             if not self.showing_depth_map:
+                print(f"🔍 DEBUG: Updating preview display...")
                 # Display preview
                 preview_image = resize_for_preview(blurred_image)
+                print(f"🔍 DEBUG: Preview image shape: {preview_image.shape}")
                 self.preview_display.set_image(preview_image)
+                print(f"🔍 DEBUG: Preview display updated")
+            else:
+                print(f"🔍 DEBUG: Skipping preview update - showing depth map")
             
             self.status_bar.showMessage("Blur effect applied successfully")
             self.progress_bar.setVisible(False)
@@ -557,6 +811,10 @@ class DepthBlurApp(QMainWindow):
             self.dark_mode_action.setText('Dark Mode')
         
         self.apply_theme()
+        
+        # Save preference
+        self.preferences.set_preference('ui', 'dark_mode', self.dark_mode)
+        self.save_preferences()
     
     def toggle_depth_map(self):
         """Toggle between image preview and depth map display."""
@@ -576,6 +834,110 @@ class DepthBlurApp(QMainWindow):
             self.preview_label.setText("Preview (Click to set focal point)")
             self.preview_label.setStyleSheet("color: #0066cc; padding: 4px;")  # Blue for preview
             self.show_image_preview()
+    
+    def set_detail_level(self, level: str):
+        """Set the depth detail level and regenerate depth map if needed."""
+        print(f"🔄 Detail level changed to: {level}")
+        
+        # Update checkboxes
+        self.detail_high_action.setChecked(level == "high")
+        self.detail_medium_action.setChecked(level == "medium")
+        self.detail_low_action.setChecked(level == "low")
+        
+        # Update depth estimator
+        self.processing_thread.depth_estimator.detail_level = level
+        print(f"✅ Updated depth estimator detail_level to: {level}")
+        
+        # Save preference
+        self.preferences.set_preference('processing', 'detail_level', level)
+        self.save_preferences()
+        
+        # If we have a current image, regenerate the depth map
+        if self.current_image is not None:
+            print(f"🔄 Regenerating depth map with {level} detail...")
+            self.status_bar.showMessage(f"Regenerating depth map with {level} detail...")
+            self.depth_map = None  # Clear cached depth map
+            self.blurred_image = None  # Clear blurred result
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)  # Indeterminate progress
+            self.processing_thread.estimate_depth(self.current_image)
+        else:
+            print(f"ℹ️ No current image loaded, detail level set to {level} for next image")
+    
+    def toggle_cpu_mode(self):
+        """Toggle CPU mode and regenerate processing if needed."""
+        cpu_mode = self.cpu_mode_action.isChecked()
+        
+        if cpu_mode:
+            self.status_bar.showMessage("Switching to CPU mode...")
+            print("🖥️ CPU Mode enabled - forcing CPU processing")
+            self.mode_label.setText("CPU")
+            self.mode_label.setStyleSheet("color: #ff6600; font-weight: bold; padding: 2px 8px;")
+        else:
+            self.status_bar.showMessage("Switching to GPU mode...")
+            print("🚀 GPU Mode enabled - using GPU acceleration")
+            self.mode_label.setText("GPU")
+            self.mode_label.setStyleSheet("color: #0078d4; font-weight: bold; padding: 2px 8px;")
+        
+        # Update processing thread to use CPU mode
+        self.processing_thread.force_cpu_mode = cpu_mode
+        self.processing_thread.depth_estimator.set_cpu_mode(cpu_mode)
+        self.processing_thread.blur_processor.set_cpu_mode(cpu_mode)
+        
+        # Save preference
+        self.preferences.set_preference('processing', 'cpu_mode', cpu_mode)
+        self.save_preferences()
+        
+        # If we have a current image, regenerate everything
+        if self.current_image is not None:
+            self.status_bar.showMessage(f"Regenerating with {'CPU' if cpu_mode else 'GPU'} processing...")
+            self.depth_map = None  # Clear cached depth map
+            self.blurred_image = None  # Clear blurred result
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)  # Indeterminate progress
+            self.processing_thread.estimate_depth(self.current_image)
+    
+    def toggle_hole_filling(self):
+        """Toggle hole filling and regenerate depth map if needed."""
+        hole_filling_enabled = self.hole_filling_action.isChecked()
+        
+        print(f"🔧 Hole filling: {'enabled' if hole_filling_enabled else 'disabled'}")
+        
+        # Update depth estimator setting
+        self.update_depth_settings(hole_filling_enabled=hole_filling_enabled)
+        
+        # Save preference
+        self.preferences.set_preference('depth', 'hole_filling_enabled', hole_filling_enabled)
+        self.save_preferences()
+    
+    def toggle_background_correction(self):
+        """Toggle background correction and regenerate depth map if needed."""
+        background_correction_enabled = self.background_correction_action.isChecked()
+        
+        print(f"🔧 Background correction: {'enabled' if background_correction_enabled else 'disabled'}")
+        
+        # Update depth estimator setting
+        self.update_depth_settings(background_correction_enabled=background_correction_enabled)
+        
+        # Save preference
+        self.preferences.set_preference('depth', 'background_correction_enabled', background_correction_enabled)
+        self.save_preferences()
+    
+    def set_smoothing_strength(self, strength: str):
+        """Set smoothing strength and regenerate depth map if needed."""
+        print(f"🔧 Smoothing strength changed to: {strength}")
+        
+        # Update checkboxes
+        self.smoothing_low_action.setChecked(strength == "low")
+        self.smoothing_medium_action.setChecked(strength == "medium")
+        self.smoothing_high_action.setChecked(strength == "high")
+        
+        # Update depth estimator setting
+        self.update_depth_settings(smoothing_strength=strength)
+        
+        # Save preference
+        self.preferences.set_preference('depth', 'smoothing_strength', strength)
+        self.save_preferences()
     
     def show_depth_map(self):
         """Display the depth map visualization."""
@@ -695,6 +1057,13 @@ class DepthBlurApp(QMainWindow):
                 self.preview_label.setStyleSheet("color: #ff8800; padding: 4px;")  # Orange for depth map in dark mode
             else:
                 self.preview_label.setStyleSheet("color: #0078d4; padding: 4px;")  # Blue for preview in dark mode
+            
+            # Update mode label for dark mode
+            if hasattr(self, 'mode_label'):
+                if self.mode_label.text() == "CPU":
+                    self.mode_label.setStyleSheet("color: #ff8800; font-weight: bold; padding: 2px 8px;")
+                else:
+                    self.mode_label.setStyleSheet("color: #0078d4; font-weight: bold; padding: 2px 8px;")
         else:
             # Light theme (default)
             self.setStyleSheet("")
@@ -707,6 +1076,13 @@ class DepthBlurApp(QMainWindow):
                 self.preview_label.setStyleSheet("color: #ff6600; padding: 4px;")  # Orange for depth map in light mode
             else:
                 self.preview_label.setStyleSheet("color: #0066cc; padding: 4px;")  # Blue for preview in light mode
+            
+            # Update mode label for light mode
+            if hasattr(self, 'mode_label'):
+                if self.mode_label.text() == "CPU":
+                    self.mode_label.setStyleSheet("color: #ff6600; font-weight: bold; padding: 2px 8px;")
+                else:
+                    self.mode_label.setStyleSheet("color: #0066cc; font-weight: bold; padding: 2px 8px;")
     
     def closeEvent(self, event):
         """Handle application close."""
