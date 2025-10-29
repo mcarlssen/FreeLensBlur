@@ -84,7 +84,7 @@ class DepthEstimator:
     
     def _preprocess_image(self, image_array: np.ndarray) -> dict:
         """
-        Preprocess image for MiDaS model.
+        Preprocess image for MiDaS model with high resolution support.
         
         Args:
             image_array: RGB image array (H, W, 3)
@@ -96,14 +96,52 @@ class DepthEstimator:
             return {}
             
         if self.transform is not None:
-            # Use DPTImageProcessor
+            # Use DPTImageProcessor with higher resolution
             pil_image = Image.fromarray(image_array)
-            inputs = self.transform(pil_image, return_tensors="pt")
+            
+            # Calculate optimal input size for better depth resolution
+            # Use larger input size for better detail preservation
+            height, width = image_array.shape[:2]
+            
+            # Calculate scale to get closer to original resolution
+            # Target around 1024px on the longer side for better detail
+            max_dim = max(height, width)
+            if max_dim > 1024:
+                scale = 1024 / max_dim
+                target_height = int(height * scale)
+                target_width = int(width * scale)
+            else:
+                target_height = height
+                target_width = width
+            
+            # Ensure dimensions are multiples of 32 (model requirement)
+            target_height = ((target_height + 31) // 32) * 32
+            target_width = ((target_width + 31) // 32) * 32
+            
+            print(f"Using high-res depth input: {target_width}x{target_height} (original: {width}x{height})")
+            
+            # Resize image for processing
+            resized_image = cv2.resize(image_array, (target_width, target_height))
+            pil_resized = Image.fromarray(resized_image)
+            
+            inputs = self.transform(pil_resized, return_tensors="pt")
             return {k: v.to(self.device) for k, v in inputs.items()}
         else:
-            # Fallback preprocessing
-            # Resize to model input size (typically 384x384)
-            resized = cv2.resize(image_array, (384, 384))
+            # Fallback preprocessing with higher resolution
+            height, width = image_array.shape[:2]
+            
+            # Use larger input size for better detail
+            max_dim = max(height, width)
+            if max_dim > 512:
+                scale = 512 / max_dim
+                target_size = int(512)
+            else:
+                target_size = max_dim
+            
+            # Ensure multiple of 32
+            target_size = ((target_size + 31) // 32) * 32
+            
+            resized = cv2.resize(image_array, (target_size, target_size))
             
             # Normalize to [0, 1] then to ImageNet stats
             normalized = resized.astype(np.float32) / 255.0
@@ -117,7 +155,7 @@ class DepthEstimator:
     
     def _postprocess_depth(self, depth_tensor, original_size: Tuple[int, int]) -> np.ndarray:
         """
-        Postprocess depth tensor to normalized depth map.
+        Postprocess depth tensor to normalized depth map with edge enhancement.
         
         Args:
             depth_tensor: Raw depth output from model
@@ -132,21 +170,67 @@ class DepthEstimator:
         # Remove batch dimension and move to CPU
         depth = depth_tensor.squeeze().cpu().numpy()
         
-        # Resize to original image size
-        depth_resized = cv2.resize(depth, (original_size[1], original_size[0]))
+        # Use high-quality interpolation for resizing
+        depth_resized = cv2.resize(depth, (original_size[1], original_size[0]), 
+                                 interpolation=cv2.INTER_CUBIC)
+        
+        # Apply edge-preserving smoothing to reduce artifacts
+        # This helps with the "through-holes" issue you mentioned
+        depth_smoothed = cv2.bilateralFilter(depth_resized.astype(np.float32), 
+                                           d=9, sigmaColor=0.1, sigmaSpace=50)
         
         # Normalize to 0-1 range (invert so closer objects have higher values)
-        depth_min = depth_resized.min()
-        depth_max = depth_resized.max()
+        depth_min = depth_smoothed.min()
+        depth_max = depth_smoothed.max()
         
         if depth_max > depth_min:
-            depth_normalized = (depth_resized - depth_min) / (depth_max - depth_min)
+            depth_normalized = (depth_smoothed - depth_min) / (depth_max - depth_min)
             # Invert so closer = higher values
             depth_normalized = 1.0 - depth_normalized
         else:
-            depth_normalized = np.ones_like(depth_resized) * 0.5
+            depth_normalized = np.ones_like(depth_smoothed) * 0.5
         
-        return depth_normalized
+        # Apply additional edge enhancement for better subject boundaries
+        # This helps with the ear/collar edge issues
+        depth_enhanced = self._enhance_depth_edges(depth_normalized)
+        
+        return depth_enhanced
+    
+    def _enhance_depth_edges(self, depth_map: np.ndarray) -> np.ndarray:
+        """
+        Enhance depth map edges for better subject boundary detection.
+        
+        Args:
+            depth_map: Normalized depth map (0-1)
+            
+        Returns:
+            Edge-enhanced depth map
+        """
+        # Detect edges in the depth map
+        edges = cv2.Canny((depth_map * 255).astype(np.uint8), 50, 150)
+        
+        # Dilate edges slightly to create transition zones
+        kernel = np.ones((3, 3), np.uint8)
+        edges_dilated = cv2.dilate(edges, kernel, iterations=1)
+        
+        # Create smooth transition zones around edges
+        edge_mask = edges_dilated.astype(np.float32) / 255.0
+        
+        # Apply Gaussian blur to edge mask for smooth transitions
+        edge_mask_smooth = cv2.GaussianBlur(edge_mask, (5, 5), 1.0)
+        
+        # Enhance depth transitions near edges
+        # This helps create more natural depth boundaries
+        depth_enhanced = depth_map.copy()
+        
+        # Apply slight smoothing in edge regions
+        depth_smooth = cv2.GaussianBlur(depth_map, (3, 3), 0.5)
+        
+        # Blend original and smoothed depth based on edge proximity
+        depth_enhanced = depth_enhanced * (1 - edge_mask_smooth * 0.3) + \
+                        depth_smooth * (edge_mask_smooth * 0.3)
+        
+        return depth_enhanced
     
     def _fallback_depth_estimation(self, image_array: np.ndarray) -> np.ndarray:
         """

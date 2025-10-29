@@ -18,89 +18,183 @@ import cv2
 from depth_estimator import DepthEstimator
 from blur_processor import BlurProcessor
 from utils.image_loader import load_jpeg_image, save_jpeg_image, resize_for_preview
-from utils.performance import PerformanceMonitor, optimize_image_for_processing, estimate_processing_time
 
 
 class ImageDisplayWidget(QLabel):
     """Custom widget for displaying images with click handling."""
     
-    clicked = pyqtSignal(int, int)  # x, y coordinates
+    clicked = pyqtSignal(int, int)  # Signal emitted when image is clicked
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(400, 300)
         self.setStyleSheet("border: 1px solid gray; background-color: #f0f0f0;")
         self.setAlignment(Qt.AlignCenter)
-        self.setScaledContents(True)
+        self.setScaledContents(False)  # Don't stretch to fill widget
         self.focal_point = None
         self.scale_factor = 1.0
-        
+        self.image_offset_x = 0
+        self.image_offset_y = 0
+        self.original_image_size = None
+        self.preview_image_size = None
+    
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            # Calculate actual image coordinates
-            x = int(event.x() / self.scale_factor)
-            y = int(event.y() / self.scale_factor)
-            self.focal_point = (x, y)
-            self.clicked.emit(x, y)
-            self.update()
+        """Handle mouse click events."""
+        if event.button() == Qt.LeftButton and self.preview_image_size is not None:
+            click_x = event.x()
+            click_y = event.y()
+            
+            preview_width, preview_height = self.preview_image_size
+            scaled_width = int(preview_width * self.scale_factor)
+            scaled_height = int(preview_height * self.scale_factor)
+            
+            image_left = self.image_offset_x
+            image_right = self.image_offset_x + scaled_width
+            image_top = self.image_offset_y
+            image_bottom = self.image_offset_y + scaled_height
+            
+            if (image_left <= click_x <= image_right and image_top <= click_y <= image_bottom):
+                relative_x = click_x - image_left
+                relative_y = click_y - image_top
+                
+                preview_x = int(relative_x / self.scale_factor)
+                preview_y = int(relative_y / self.scale_factor)
+                
+                preview_x = max(0, min(preview_x, preview_width - 1))
+                preview_y = max(0, min(preview_y, preview_height - 1))
+                
+                orig_width, orig_height = self.original_image_size
+                scale_x = orig_width / preview_width
+                scale_y = orig_height / preview_height
+                
+                image_x = int(preview_x * scale_x)
+                image_y = int(preview_y * scale_y)
+                
+                image_x = max(0, min(image_x, orig_width - 1))
+                image_y = max(0, min(image_y, orig_height - 1))
+                
+                self.focal_point = (image_x, image_y)
+                self.clicked.emit(image_x, image_y)
+                self.update()
     
     def set_image(self, image_array: np.ndarray):
         """Set the image to display."""
-        if image_array is None:
-            self.clear()
-            return
-        
-        # Convert numpy array to QImage
-        height, width, channel = image_array.shape
-        bytes_per_line = 3 * width
-        q_image = QImage(image_array.data, width, height, bytes_per_line, QImage.Format_RGB888)
-        
-        # Convert to QPixmap
-        pixmap = QPixmap.fromImage(q_image)
-        
-        # Calculate scale factor for coordinate mapping
-        widget_size = self.size()
-        pixmap_size = pixmap.size()
-        
-        scale_x = pixmap_size.width() / widget_size.width()
-        scale_y = pixmap_size.height() / widget_size.height()
-        self.scale_factor = max(scale_x, scale_y)
-        
-        self.setPixmap(pixmap)
+        try:
+            if image_array is None:
+                self.clear()
+                self.original_image_size = None
+                self.preview_image_size = None
+                return
+            
+            height, width, channel = image_array.shape
+            self.preview_image_size = (width, height)
+            
+            bytes_per_line = 3 * width
+            q_image = QImage(image_array.data, width, height, bytes_per_line, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_image)
+            
+            self._recalculate_image_positioning()
+            
+            preview_width, preview_height = self.preview_image_size
+            scaled_width = int(preview_width * self.scale_factor)
+            scaled_height = int(preview_height * self.scale_factor)
+            
+            scaled_pixmap = pixmap.scaled(scaled_width, scaled_height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(scaled_pixmap)
+        except Exception as e:
+            print(f"Error in set_image: {e}")
+    
+    def set_original_image_size(self, width: int, height: int):
+        """Set the original full-size image dimensions."""
+        self.original_image_size = (width, height)
     
     def paintEvent(self, event):
         super().paintEvent(event)
         
         # Draw focal point indicator
-        if self.focal_point is not None:
+        if self.focal_point is not None and self.original_image_size is not None:
             painter = QPainter(self)
             painter.setPen(QPen(QColor(255, 0, 0), 3))
             
+            # Convert original image coordinates back to preview coordinates for display
+            orig_x, orig_y = self.focal_point
+            orig_width, orig_height = self.original_image_size
+            preview_width, preview_height = self.preview_image_size
+            
+            scale_x = preview_width / orig_width
+            scale_y = preview_height / orig_height
+            
+            preview_x = orig_x * scale_x
+            preview_y = orig_y * scale_y
+            
             # Calculate display coordinates
-            x = int(self.focal_point[0] * self.scale_factor)
-            y = int(self.focal_point[1] * self.scale_factor)
+            display_x = int(self.image_offset_x + preview_x * self.scale_factor)
+            display_y = int(self.image_offset_y + preview_y * self.scale_factor)
             
             # Draw circle
-            painter.drawEllipse(x - 10, y - 10, 20, 20)
-            painter.drawLine(x - 15, y, x + 15, y)
-            painter.drawLine(x, y - 15, x, y + 15)
+            painter.drawEllipse(display_x - 10, display_y - 10, 20, 20)
+            painter.drawLine(display_x - 15, display_y, display_x + 15, display_y)
+            painter.drawLine(display_x, display_y - 15, display_x, display_y + 15)
+    
+    def resizeEvent(self, event):
+        """Handle widget resize to recalculate image positioning."""
+        super().resizeEvent(event)
+        # Recalculate image positioning if we have an image
+        if self.preview_image_size is not None:
+            # Recalculate scale factor and offsets
+            self._recalculate_image_positioning()
+            # Trigger a repaint to update focal point position
+            self.update()
+    
+    def _recalculate_image_positioning(self):
+        """Recalculate image positioning after resize."""
+        if self.preview_image_size is None:
+            return
+        
+        preview_width, preview_height = self.preview_image_size
+        
+        # Calculate scale factor to fit image in widget while preserving aspect ratio
+        widget_size = self.size()
+        
+        scale_x = widget_size.width() / preview_width
+        scale_y = widget_size.height() / preview_height
+        self.scale_factor = min(scale_x, scale_y)  # Use min to fit within widget
+        
+        # Calculate scaled image size
+        scaled_width = int(preview_width * self.scale_factor)
+        scaled_height = int(preview_height * self.scale_factor)
+        
+        # Calculate offset to center the image
+        self.image_offset_x = (widget_size.width() - scaled_width) // 2
+        self.image_offset_y = (widget_size.height() - scaled_height) // 2
 
 
 class ProcessingThread(QThread):
     """Thread for processing depth estimation and blur application."""
     
-    progress_updated = pyqtSignal(int, int)  # current, total
+    # Signals for communication with main thread
     depth_completed = pyqtSignal(np.ndarray)  # depth map
     blur_completed = pyqtSignal(np.ndarray)  # blurred image
-    error_occurred = pyqtSignal(str)  # error message
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.depth_estimator = DepthEstimator()
         self.blur_processor = BlurProcessor()
         self.current_image = None
+        self.depth_map = None
         self.focal_point = None
-        self.blur_strength = 5.0
+        self.blurred_result = None
+        self.focal_length = 50.0
+        
+    def has_blur_result(self):
+        """Check if blur processing has completed."""
+        return self.blurred_result is not None
+    
+    def get_blur_result(self):
+        """Get the blur result and clear it."""
+        result = self.blurred_result
+        self.blurred_result = None
+        return result
         
     def estimate_depth(self, image_array: np.ndarray):
         """Estimate depth map for the image."""
@@ -108,10 +202,15 @@ class ProcessingThread(QThread):
         self.focal_point = None
         self.start()
     
-    def apply_blur(self, focal_point: Tuple[int, int], blur_strength: float):
+    def apply_blur(self, focal_point: Tuple[int, int], blur_strength: float, focal_length: float = 50.0):
         """Apply blur effect with given parameters."""
+        if self.isRunning():
+            self.terminate()
+        self.wait(1000)
+        
         self.focal_point = focal_point
         self.blur_strength = blur_strength
+        self.focal_length = focal_length
         self.start()
     
     def run(self):
@@ -121,26 +220,25 @@ class ProcessingThread(QThread):
                 return
             
             # Estimate depth if not already done
-            if not hasattr(self, 'depth_map') or self.depth_map is None:
-                self.progress_updated.emit(0, 100)
+            if self.depth_map is None:
                 self.depth_map = self.depth_estimator.estimate_depth(self.current_image)
+                # Signal that depth estimation is complete
                 self.depth_completed.emit(self.depth_map)
             
             # Apply blur if focal point is set
             if self.focal_point is not None:
-                self.progress_updated.emit(50, 100)
-                
-                # Use simple blur for preview
-                blurred = self.blur_processor.apply_focal_blur_simple(
+                blurred = self.blur_processor.apply_focal_blur_gpu(
                     self.current_image, self.depth_map, 
-                    self.focal_point, self.blur_strength
+                    self.focal_point, self.blur_strength, self.focal_length
                 )
-                
-                self.progress_updated.emit(100, 100)
+                self.blurred_result = blurred
+                # Signal that blur processing is complete
                 self.blur_completed.emit(blurred)
                 
         except Exception as e:
-            self.error_occurred.emit(str(e))
+            print(f"Error in ProcessingThread.run(): {e}")
+            import traceback
+            traceback.print_exc()
 
 
 class DepthBlurApp(QMainWindow):
@@ -155,7 +253,9 @@ class DepthBlurApp(QMainWindow):
         self.blur_timer = QTimer()
         self.blur_timer.setSingleShot(True)
         self.blur_timer.timeout.connect(self._apply_blur_debounced)
-        self.performance_monitor = PerformanceMonitor()
+        self.dark_mode = False
+        self.showing_depth_map = False  # Track if we're showing depth map
+        self.focal_length = 50.0  # Default focal length in mm
         
         self.init_ui()
         self.setup_processing_thread()
@@ -207,69 +307,102 @@ class DepthBlurApp(QMainWindow):
         exit_action.setShortcut('Ctrl+Q')
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+        
+        # View menu
+        view_menu = menubar.addMenu('View')
+        
+        self.dark_mode_action = QAction('Dark Mode', self)
+        self.dark_mode_action.setCheckable(True)
+        self.dark_mode_action.setShortcut('Ctrl+D')
+        self.dark_mode_action.triggered.connect(self.toggle_dark_mode)
+        view_menu.addAction(self.dark_mode_action)
+        
+        view_menu.addSeparator()
+        
+        self.depth_map_action = QAction('Show Depth Map', self)
+        self.depth_map_action.setCheckable(True)
+        self.depth_map_action.setShortcut('Ctrl+M')
+        self.depth_map_action.triggered.connect(self.toggle_depth_map)
+        view_menu.addAction(self.depth_map_action)
     
     def create_image_display(self, parent_layout):
         """Create the image display area."""
-        # Create splitter for side-by-side display
-        splitter = QSplitter(Qt.Horizontal)
-        parent_layout.addWidget(splitter)
-        
-        # Original image panel
-        original_frame = QFrame()
-        original_frame.setFrameStyle(QFrame.StyledPanel)
-        original_layout = QVBoxLayout(original_frame)
-        
-        original_label = QLabel("Original")
-        original_label.setAlignment(Qt.AlignCenter)
-        original_label.setFont(QFont("Arial", 12, QFont.Bold))
-        original_layout.addWidget(original_label)
-        
-        self.original_display = ImageDisplayWidget()
-        original_layout.addWidget(self.original_display)
-        
-        # Preview image panel
+        # Create single preview panel (removed original view)
         preview_frame = QFrame()
         preview_frame.setFrameStyle(QFrame.StyledPanel)
         preview_layout = QVBoxLayout(preview_frame)
         
-        preview_label = QLabel("Preview")
+        preview_label = QLabel("Preview (Click to set focal point)")
         preview_label.setAlignment(Qt.AlignCenter)
         preview_label.setFont(QFont("Arial", 12, QFont.Bold))
+        preview_label.setStyleSheet("color: #0066cc; padding: 4px;")
+        preview_label.setMaximumHeight(30)  # Fixed height
+        self.preview_label = preview_label  # Store reference for updates
         preview_layout.addWidget(preview_label)
         
         self.preview_display = ImageDisplayWidget()
         self.preview_display.clicked.connect(self.on_focal_point_clicked)
+        self.preview_display.setStyleSheet("border: 2px solid #0066cc; background-color: #f0f0f0;")
         preview_layout.addWidget(self.preview_display)
         
-        # Add panels to splitter
-        splitter.addWidget(original_frame)
-        splitter.addWidget(preview_frame)
-        splitter.setSizes([600, 600])
+        parent_layout.addWidget(preview_frame)
     
     def create_controls(self, parent_layout):
         """Create the control panel."""
         controls_layout = QHBoxLayout()
         
-        # Blur strength slider
+        # Blur strength label - compact
         blur_label = QLabel("Blur Strength:")
+        blur_label.setMaximumHeight(25)  # Fixed height
+        blur_label.setStyleSheet("padding: 2px;")
         controls_layout.addWidget(blur_label)
         
+        # Blur strength slider - compact
         self.blur_slider = QSlider(Qt.Horizontal)
         self.blur_slider.setMinimum(0)
         self.blur_slider.setMaximum(10)
-        self.blur_slider.setValue(5)
+        self.blur_slider.setValue(1)
+        self.blur_slider.setMaximumHeight(25)  # Fixed height
         self.blur_slider.valueChanged.connect(self.on_blur_strength_changed)
         controls_layout.addWidget(self.blur_slider)
         
-        self.blur_value_label = QLabel("5.0")
+        # Blur value label - compact
+        self.blur_value_label = QLabel("1.0")
         self.blur_value_label.setMinimumWidth(30)
+        self.blur_value_label.setMaximumHeight(25)  # Fixed height
+        self.blur_value_label.setStyleSheet("padding: 2px;")
         controls_layout.addWidget(self.blur_value_label)
+        
+        # Add some spacing
+        controls_layout.addSpacing(20)
+        
+        # Focal length slider
+        focal_label = QLabel("Focal Length:")
+        focal_label.setMaximumHeight(25)  # Fixed height
+        focal_label.setStyleSheet("padding: 2px;")
+        controls_layout.addWidget(focal_label)
+        
+        self.focal_slider = QSlider(Qt.Horizontal)
+        self.focal_slider.setMinimum(24)  # Wide angle
+        self.focal_slider.setMaximum(200)  # Telephoto
+        self.focal_slider.setValue(50)  # Normal lens
+        self.focal_slider.setMaximumHeight(25)  # Fixed height
+        self.focal_slider.valueChanged.connect(self.on_focal_length_changed)
+        controls_layout.addWidget(self.focal_slider)
+        
+        self.focal_value_label = QLabel("50mm")
+        self.focal_value_label.setMinimumWidth(40)
+        self.focal_value_label.setMaximumHeight(25)  # Fixed height
+        self.focal_value_label.setStyleSheet("padding: 2px;")
+        controls_layout.addWidget(self.focal_value_label)
         
         controls_layout.addStretch()
         
-        # Progress bar
+        # Progress bar - compact
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setMinimumWidth(200)
+        self.progress_bar.setMaximumHeight(25)  # Fixed height
         controls_layout.addWidget(self.progress_bar)
         
         parent_layout.addLayout(controls_layout)
@@ -283,10 +416,9 @@ class DepthBlurApp(QMainWindow):
     def setup_processing_thread(self):
         """Setup the processing thread."""
         self.processing_thread = ProcessingThread()
-        self.processing_thread.progress_updated.connect(self.update_progress)
+        # Connect signals
         self.processing_thread.depth_completed.connect(self.on_depth_completed)
         self.processing_thread.blur_completed.connect(self.on_blur_completed)
-        self.processing_thread.error_occurred.connect(self.on_error)
     
     def open_image(self):
         """Open an image file."""
@@ -310,17 +442,21 @@ class DepthBlurApp(QMainWindow):
         self.depth_map = None
         self.blurred_image = None
         
-        # Display original image
+        # Display preview image
         preview_image = resize_for_preview(image_array)
-        self.original_display.set_image(preview_image)
         self.preview_display.set_image(preview_image)
         
+        # Set original image size for coordinate mapping
+        orig_height, orig_width = image_array.shape[:2]
+        self.preview_display.set_original_image_size(orig_width, orig_height)
+        
         # Estimate processing time
-        estimated_time = estimate_processing_time(image_array.shape[:2], 5.0)
+        estimated_time = 5.0  # Simple estimate
         self.status_bar.showMessage(f"Estimating depth map... (estimated {estimated_time:.1f}s)")
         
         # Start depth estimation
         self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
         self.processing_thread.estimate_depth(image_array)
     
     def save_image(self):
@@ -343,14 +479,21 @@ class DepthBlurApp(QMainWindow):
     def on_focal_point_clicked(self, x: int, y: int):
         """Handle focal point click."""
         if self.depth_map is None:
+            self.status_bar.showMessage("Depth map not ready yet")
             return
-        
-        self.status_bar.showMessage(f"Focal point set at ({x}, {y})")
-        self.blur_timer.start(300)  # Debounce blur application
+            
+        self.status_bar.showMessage(f"Focal point set at ({x}, {y}) - applying blur effect...")
+        self._apply_blur_debounced()
     
     def on_blur_strength_changed(self, value: int):
         """Handle blur strength slider change."""
         self.blur_value_label.setText(f"{value}.0")
+        self.blur_timer.start(300)  # Debounce blur application
+    
+    def on_focal_length_changed(self, value: int):
+        """Handle focal length slider change."""
+        self.focal_length = float(value)
+        self.focal_value_label.setText(f"{value}mm")
         self.blur_timer.start(300)  # Debounce blur application
     
     def _apply_blur_debounced(self):
@@ -362,62 +505,253 @@ class DepthBlurApp(QMainWindow):
         if focal_point is None:
             return
         
-        blur_strength = self.blur_slider.value()
+        # Check image size - if too large, skip processing
+        height, width = self.current_image.shape[:2]
+        total_pixels = height * width
         
-        self.status_bar.showMessage("Applying blur effect...")
+        if total_pixels > 15_000_000:  # 15 megapixels
+            self.status_bar.showMessage("Image too large for blur processing")
+            return
+        
+        blur_strength = self.blur_slider.value()
+        focal_length = self.focal_length
+        self.status_bar.showMessage(f"Applying blur effect... (strength: {blur_strength}, focal: {focal_length}mm)")
         self.progress_bar.setVisible(True)
-        self.processing_thread.apply_blur(focal_point, blur_strength)
-    
-    def update_progress(self, current: int, total: int):
-        """Update progress bar."""
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        self.processing_thread.apply_blur(focal_point, blur_strength, focal_length)
     
     def on_depth_completed(self, depth_map: np.ndarray):
         """Handle depth estimation completion."""
         self.depth_map = depth_map
-        self.status_bar.showMessage("Depth map generated. Click to set focal point.")
+        self.status_bar.showMessage("Depth map generated. Click on the Preview panel to set focal point.")
         self.progress_bar.setVisible(False)
     
     def on_blur_completed(self, blurred_image: np.ndarray):
         """Handle blur application completion."""
-        self.blurred_image = blurred_image
-        
-        # Display preview
-        preview_image = resize_for_preview(blurred_image)
-        self.preview_display.set_image(preview_image)
-        
-        self.status_bar.showMessage("Blur effect applied")
-        self.progress_bar.setVisible(False)
+        try:
+            self.blurred_image = blurred_image
+            
+            # Only update preview if we're not showing depth map
+            if not self.showing_depth_map:
+                # Display preview
+                preview_image = resize_for_preview(blurred_image)
+                self.preview_display.set_image(preview_image)
+            
+            self.status_bar.showMessage("Blur effect applied successfully")
+            self.progress_bar.setVisible(False)
+            
+        except Exception as e:
+            print(f"Error in on_blur_completed: {e}")
+            self.status_bar.showMessage(f"Error updating preview: {str(e)}")
+            self.progress_bar.setVisible(False)
     
-    def on_error(self, error_message: str):
-        """Handle processing errors."""
-        QMessageBox.critical(self, "Error", f"Processing error: {error_message}")
-        self.status_bar.showMessage("Error occurred")
-        self.progress_bar.setVisible(False)
+    def toggle_dark_mode(self):
+        """Toggle between light and dark mode."""
+        self.dark_mode = not self.dark_mode
+        self.dark_mode_action.setChecked(self.dark_mode)
+        
+        # Update menu text
+        if self.dark_mode:
+            self.dark_mode_action.setText('Light Mode')
+        else:
+            self.dark_mode_action.setText('Dark Mode')
+        
+        self.apply_theme()
+    
+    def toggle_depth_map(self):
+        """Toggle between image preview and depth map display."""
+        if self.depth_map is None:
+            QMessageBox.information(self, "Information", "No depth map available. Please load an image first.")
+            self.depth_map_action.setChecked(False)
+            return
+        
+        self.showing_depth_map = not self.showing_depth_map
+        self.depth_map_action.setChecked(self.showing_depth_map)
+        
+        if self.showing_depth_map:
+            self.preview_label.setText("Depth Map (Click to set focal point)")
+            self.preview_label.setStyleSheet("color: #ff6600; padding: 4px;")  # Orange for depth map
+            self.show_depth_map()
+        else:
+            self.preview_label.setText("Preview (Click to set focal point)")
+            self.preview_label.setStyleSheet("color: #0066cc; padding: 4px;")  # Blue for preview
+            self.show_image_preview()
+    
+    def show_depth_map(self):
+        """Display the depth map visualization."""
+        if self.depth_map is None:
+            return
+        
+        # Create depth map visualization
+        depth_vis = self.create_depth_visualization(self.depth_map)
+        
+        # Resize for preview
+        preview_depth = resize_for_preview(depth_vis)
+        
+        # Display the depth map
+        self.preview_display.set_image(preview_depth)
+    
+    def show_image_preview(self):
+        """Display the image preview (original or blurred)."""
+        if self.blurred_image is not None:
+            # Show blurred image
+            preview_image = resize_for_preview(self.blurred_image)
+        elif self.current_image is not None:
+            # Show original image
+            preview_image = resize_for_preview(self.current_image)
+        else:
+            return
+        
+        self.preview_display.set_image(preview_image)
+    
+    def create_depth_visualization(self, depth_map: np.ndarray) -> np.ndarray:
+        """Create a colorized visualization of the depth map."""
+        # Normalize to 0-255
+        depth_vis = (depth_map * 255).astype(np.uint8)
+        
+        # Apply colormap (jet colormap for depth visualization)
+        depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+        
+        return depth_colored
+    
+    def apply_theme(self):
+        """Apply the current theme (light or dark)."""
+        if self.dark_mode:
+            # Dark theme
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #2b2b2b;
+                    color: #ffffff;
+                }
+                QMenuBar {
+                    background-color: #3c3c3c;
+                    color: #ffffff;
+                    border-bottom: 1px solid #555555;
+                }
+                QMenuBar::item {
+                    background-color: transparent;
+                    padding: 4px 8px;
+                }
+                QMenuBar::item:selected {
+                    background-color: #555555;
+                }
+                QMenu {
+                    background-color: #3c3c3c;
+                    color: #ffffff;
+                    border: 1px solid #555555;
+                }
+                QMenu::item:selected {
+                    background-color: #555555;
+                }
+                QLabel {
+                    color: #ffffff;
+                }
+                QSlider::groove:horizontal {
+                    border: 1px solid #555555;
+                    height: 8px;
+                    background: #3c3c3c;
+                    border-radius: 4px;
+                }
+                QSlider::handle:horizontal {
+                    background: #0078d4;
+                    border: 1px solid #555555;
+                    width: 18px;
+                    margin: -2px 0;
+                    border-radius: 9px;
+                }
+                QSlider::handle:horizontal:hover {
+                    background: #106ebe;
+                }
+                QProgressBar {
+                    border: 1px solid #555555;
+                    border-radius: 4px;
+                    text-align: center;
+                    background-color: #3c3c3c;
+                    color: #ffffff;
+                }
+                QProgressBar::chunk {
+                    background-color: #0078d4;
+                    border-radius: 3px;
+                }
+                QStatusBar {
+                    background-color: #3c3c3c;
+                    color: #ffffff;
+                    border-top: 1px solid #555555;
+                }
+                QFrame {
+                    background-color: #2b2b2b;
+                    border: 1px solid #555555;
+                }
+                QSplitter::handle {
+                    background-color: #555555;
+                }
+            """)
+            
+            # Update image display widget
+            self.preview_display.setStyleSheet("border: 2px solid #0078d4; background-color: #2b2b2b;")
+            
+            # Update label colors for dark mode
+            if self.showing_depth_map:
+                self.preview_label.setStyleSheet("color: #ff8800; padding: 4px;")  # Orange for depth map in dark mode
+            else:
+                self.preview_label.setStyleSheet("color: #0078d4; padding: 4px;")  # Blue for preview in dark mode
+        else:
+            # Light theme (default)
+            self.setStyleSheet("")
+            
+            # Reset image display widget to light theme
+            self.preview_display.setStyleSheet("border: 2px solid #0066cc; background-color: #f0f0f0;")
+            
+            # Update label colors for light mode
+            if self.showing_depth_map:
+                self.preview_label.setStyleSheet("color: #ff6600; padding: 4px;")  # Orange for depth map in light mode
+            else:
+                self.preview_label.setStyleSheet("color: #0066cc; padding: 4px;")  # Blue for preview in light mode
     
     def closeEvent(self, event):
         """Handle application close."""
-        if self.processing_thread and self.processing_thread.isRunning():
+        if self.processing_thread is not None:
             self.processing_thread.terminate()
             self.processing_thread.wait()
-        
-        if hasattr(self.processing_thread, 'blur_processor'):
-            self.processing_thread.blur_processor.cleanup()
+            
+            # Clean up blur processor
+            if hasattr(self.processing_thread, 'blur_processor'):
+                self.processing_thread.blur_processor.cleanup()
         
         event.accept()
 
 
+def exception_handler(exc_type, exc_value, exc_traceback):
+    """Global exception handler for debugging."""
+    print(f"Uncaught exception: {exc_type.__name__}: {exc_value}")
+    import traceback
+    traceback.print_exc()
+
+
 def main():
     """Main application entry point."""
-    app = QApplication(sys.argv)
-    app.setApplicationName("Depth Blur Filter")
-    app.setApplicationVersion("1.0")
-    
-    window = DepthBlurApp()
-    window.show()
-    
-    sys.exit(app.exec_())
+    try:
+        # Set up global exception handler
+        sys.excepthook = exception_handler
+        
+        print("Starting application...")
+        app = QApplication(sys.argv)
+        app.setApplicationName("Depth Blur Filter")
+        app.setApplicationVersion("1.0")
+        
+        print("Creating main window...")
+        window = DepthBlurApp()
+        print("Showing window...")
+        window.show()
+        
+        print("Starting event loop...")
+        sys.exit(app.exec_())
+        
+    except Exception as e:
+        print(f"Error in main(): {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

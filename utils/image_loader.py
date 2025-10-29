@@ -3,9 +3,37 @@ Image loading and validation utilities for the depth blur filter.
 """
 
 import os
-from PIL import Image
+from PIL import Image, ExifTags
 import numpy as np
 from typing import Tuple, Optional
+
+
+def apply_exif_orientation(image: Image.Image) -> Image.Image:
+    """
+    Apply EXIF orientation to the image if present.
+    
+    Args:
+        image: PIL Image object
+        
+    Returns:
+        PIL Image with correct orientation applied
+    """
+    try:
+        exif = image._getexif()
+        if exif is not None:
+            orientation = exif.get(274)  # Orientation tag
+            if orientation:
+                if orientation == 3:
+                    image = image.rotate(180, expand=True)
+                elif orientation == 6:
+                    image = image.rotate(270, expand=True)
+                elif orientation == 8:
+                    image = image.rotate(90, expand=True)
+    except (AttributeError, KeyError, TypeError):
+        # No EXIF data or error reading it
+        pass
+    
+    return image
 
 
 def load_jpeg_image(file_path: str) -> Tuple[np.ndarray, str]:
@@ -29,6 +57,9 @@ def load_jpeg_image(file_path: str) -> Tuple[np.ndarray, str]:
     try:
         # Load image with PIL
         pil_image = Image.open(file_path)
+        
+        # Apply EXIF orientation
+        pil_image = apply_exif_orientation(pil_image)
         
         # Convert to RGB if necessary (handles RGBA, L, etc.)
         if pil_image.mode != 'RGB':
@@ -76,7 +107,7 @@ def save_jpeg_image(image_array: np.ndarray, file_path: str, quality: int = 95) 
         return f"Error saving image: {str(e)}"
 
 
-def resize_for_preview(image_array: np.ndarray, max_size: Tuple[int, int] = (1920, 1080)) -> np.ndarray:
+def resize_for_preview(image_array: np.ndarray, max_size: Tuple[int, int] = (2560, 1440)) -> np.ndarray:
     """
     Resize image for preview display while maintaining aspect ratio.
     
@@ -87,23 +118,28 @@ def resize_for_preview(image_array: np.ndarray, max_size: Tuple[int, int] = (192
     Returns:
         Resized image array
     """
-    height, width = image_array.shape[:2]
-    max_width, max_height = max_size
-    
-    # Calculate scaling factor
-    scale_w = max_width / width
-    scale_h = max_height / height
-    scale = min(scale_w, scale_h, 1.0)  # Don't upscale
-    
-    if scale == 1.0:
+    try:
+        height, width = image_array.shape[:2]
+        max_width, max_height = max_size
+        
+        # Calculate scaling factor
+        scale_w = max_width / width
+        scale_h = max_height / height
+        scale = min(scale_w, scale_h, 1.0)  # Don't upscale
+        
+        if scale == 1.0:
+            return image_array
+        
+        # Calculate new dimensions
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        # Resize using PIL for better quality
+        pil_image = Image.fromarray(image_array)
+        resized = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        result = np.array(resized)
+        return result
+        
+    except Exception as e:
+        print(f"Error in resize_for_preview: {e}")
         return image_array
-    
-    # Calculate new dimensions
-    new_width = int(width * scale)
-    new_height = int(height * scale)
-    
-    # Resize using PIL for better quality
-    pil_image = Image.fromarray(image_array)
-    resized = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    return np.array(resized)
